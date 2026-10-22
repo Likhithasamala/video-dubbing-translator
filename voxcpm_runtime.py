@@ -73,10 +73,36 @@ def model_ready():
 
 def load_model(device=None):
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    import json
+    import torch
     from voxcpm import VoxCPM
 
     model_path = resolve_model_path(local_files_only=True)
     runtime_device = device or default_runtime_device()
+
+    # CPU doesn't support AVX-512 BF16 on this machine.
+    # Test float32 instead of the checkpoint's bfloat16 default.
+    config_path = model_path / "config.json"
+
+    if runtime_device == "cpu":
+        with open(config_path, "r", encoding="utf-8-sig") as f:
+            config = json.load(f)
+
+        print(
+            "Original model dtype:",
+            config.get("dtype", "bfloat16"),
+            flush=True,
+        )
+
+        config["dtype"] = "float32"
+
+        with open(config_path, "w", encoding="utf-8") as f:
+            
+            json.dump(config, f, indent=2)
+
+        print("Testing VoxCPM2 with CPU float32...", flush=True)
+
     return VoxCPM.from_pretrained(
         str(model_path),
         load_denoiser=False,

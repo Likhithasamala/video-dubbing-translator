@@ -14,26 +14,28 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from Video_Translator import SOURCE_LANGUAGES, TARGET_LANGUAGES
-from voxcpm_runtime import model_ready
+from dubbing.pipeline import OUTPUT_ROOT as OUTPUT_DIR
 
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 MODEL_PATH = BASE_DIR / "vocal-remover" / "models" / "baseline.pth"
-OUTPUT_DIR = BASE_DIR / "vocal-remover" / "final_video" / "final"
-LATENTSYNC_DIR = BASE_DIR / "third_party" / "LatentSync"
-LATENTSYNC_CHECKPOINTS = [
-    LATENTSYNC_DIR / "scripts" / "inference.py",
-    LATENTSYNC_DIR / "configs" / "unet" / "stage2_512.yaml",
-    LATENTSYNC_DIR / "checkpoints" / "latentsync_unet.pt",
-    LATENTSYNC_DIR / "checkpoints" / "whisper" / "tiny.pt",
-]
+CLI = BASE_DIR / "Video_Translator.py"
+FILE_LABELS = {
+    "video": "Dubbed video (MP4)",
+    "video_lipsync": "Lip-synced video (MP4)",
+    "audio_mp3": "Dubbed audio (MP3)",
+    "audio_wav": "Dubbed audio (WAV)",
+    "voice_only": "Voice only, no music (WAV)",
+    "subtitles": "Subtitles (SRT)",
+}
 
 state = {
     "process": None,
     "status": "Ready",
+    "progress": 0,
     "uploaded_video": "",
-    "output_video": "",
+    "result": None,
     "logs": [],
 }
 log_queue = queue.Queue()
@@ -50,32 +52,22 @@ def add_log(line):
         state["logs"] = state["logs"][-1200:]
 
 
-def expected_output_path(uploaded_video, lip_sync=False):
-    video_path = Path(uploaded_video)
-    if lip_sync:
-        return OUTPUT_DIR / f"{video_path.stem}_lipsync{video_path.suffix or '.mp4'}"
-    return OUTPUT_DIR / video_path.name
-
-
-def latentsync_files_ready():
-    return all(path.exists() for path in LATENTSYNC_CHECKPOINTS)
-
-
-def run_process(command, status, output_path=None):
+def run_process(command, status, clear_result=False):
     with state_lock:
         if state["process"] is not None:
             return False, "Another process is already running."
         state["status"] = status
-        if output_path is not None:
-            state["output_video"] = ""
+        state["progress"] = 0
+        if clear_result:
+            state["result"] = None
         state["logs"] = ["$ " + " ".join(str(part) for part in command) + "\n\n"]
 
-    thread = threading.Thread(target=worker, args=(command, output_path), daemon=True)
+    thread = threading.Thread(target=worker, args=(command,), daemon=True)
     thread.start()
     return True, "Started."
 
 
-def worker(command, output_path=None):
+def worker(command):
     try:
         process = subprocess.Popen(
             command,
@@ -83,20 +75,30 @@ def worker(command, output_path=None):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"},
         )
         with state_lock:
             state["process"] = process
 
         for line in process.stdout:
+            if line.startswith("PROGRESS "):
+                _, percent, message = (line.strip().split(" ", 2) + [""])[:3]
+                with state_lock:
+                    state["progress"] = int(percent)
+                    state["status"] = message
+            elif line.startswith("RESULT "):
+                with state_lock:
+                    state["result"] = json.loads(line[len("RESULT "):])
+                continue
             add_log(line)
 
         return_code = process.wait()
         add_log("\nDone.\n" if return_code == 0 else f"\nProcess failed with exit code {return_code}.\n")
         with state_lock:
             state["status"] = "Done" if return_code == 0 else "Failed"
-            if return_code == 0 and output_path and Path(output_path).exists():
-                state["output_video"] = str(output_path)
     except Exception as exc:
         add_log(f"\n{type(exc).__name__}: {exc}\n")
         with state_lock:
@@ -303,29 +305,44 @@ def page():
             <select id="source">{source_options}</select>
           </div>
           <div>
-            <label for="target">Target</label>
-            <select id="target">{target_options}</select>
+            <label for="target">Target (Ctrl+click for several)</label>
+            <select id="target" multiple size="6">{target_options}</select>
           </div>
         </div>
       </div>
       <div class="step">
-        <h2>3. Models</h2>
-        <div class="hint">VoxCPM2 uses an Apache-2.0 checkpoint and produces 48 kHz cloned speech. The pinned download is approximately 5 GB.</div>
-        <button class="secondary" style="margin-top:10px" onclick="downloadModel()">Download / Check Required Models</button>
-        <div id="modelHint" class="hint">Checking models...</div>
-        <button class="secondary" style="margin-top:10px" onclick="setupLatentSync()">Setup / Check LatentSync</button>
-        <div id="latentSyncHint" class="hint">Checking LatentSync...</div>
-      </div>
-      <div class="step">
-        <h2>4. Lip-sync</h2>
-        <label class="checkline" for="lipSync">
-          <input id="lipSync" type="checkbox">
-          Apply LatentSync after dubbing
+        <h2>3. Options</h2>
+        <div class="row">
+          <div>
+            <label for="voice">Dub voice</label>
+            <select id="voice">
+              <option value="auto" selected>Auto (match speaker)</option>
+              <option value="male">Male</option>
+              <option value="female">Female</option>
+            </select>
+          </div>
+          <div>
+            <label for="whisper">Recognition accuracy</label>
+            <select id="whisper">
+              <option value="small">Fast (small)</option>
+              <option value="medium" selected>Balanced (medium)</option>
+              <option value="large-v3">Best (large-v3, slow)</option>
+            </select>
+          </div>
+        </div>
+        <label class="checkline" for="separate" style="margin-top:10px">
+          <input id="separate" type="checkbox" checked>
+          Keep background music &amp; effects
         </label>
-        <div class="hint">Requires a separate LatentSync setup and an NVIDIA CUDA GPU.</div>
+        <label class="checkline" for="lipSync" style="margin-top:8px">
+          <input id="lipSync" type="checkbox">
+          Lip sync (HD, only while the on-screen person speaks; ~2 s per frame on CPU)
+        </label>
+        <button class="secondary" style="margin-top:10px" onclick="downloadModel()">Download Models for Selected Languages</button>
+        <div id="modelHint" class="hint">All models are free and run offline after the first download.</div>
       </div>
       <div class="step">
-        <h2>5. Generate</h2>
+        <h2>4. Generate</h2>
         <div class="actions">
           <button id="startButton" class="primary" onclick="startDubbing()">Start Dubbing</button>
           <button class="danger" onclick="cancelRun()">Cancel</button>
@@ -341,11 +358,13 @@ def page():
           <a id="videoLink" class="hint" href="#" target="_blank" rel="noreferrer">Open video</a>
         </div>
         <video id="finalVideo" controls playsinline preload="metadata"></video>
+        <div id="downloads" class="hint" style="margin-top:10px;line-height:1.8"></div>
       </div>
       <div class="statusbar">
         <h2 style="margin:0;font-size:18px">Process Log</h2>
         <span id="status" class="badge">Ready</span>
       </div>
+      <progress id="progress" max="100" value="0" style="width:100%;margin-bottom:10px"></progress>
       <div id="console" class="console">Ready. Upload a video, download the model once, then start dubbing.</div>
     </section>
   </section>
@@ -378,15 +397,22 @@ async function refresh() {{
   const data = await api('/api/status');
   uploadedVideoPath = data.uploadedVideo || '';
   setStatus(data.status);
-  document.getElementById('console').textContent = data.logs || 'Ready.';
-  document.getElementById('modelHint').textContent = data.modelInstalled
-    ? `Vocal model ready (${{data.modelSizeMb}} MB); VoxCPM2 ${{data.voxcpmModelInstalled ? 'ready' : 'not installed'}}.`
-    : 'Vocal model not installed; VoxCPM2 ' + (data.voxcpmModelInstalled ? 'ready.' : 'not installed.');
-  document.getElementById('latentSyncHint').textContent = data.latentSyncReady
-    ? 'LatentSync files ready.'
-    : 'Optional: not installed yet.';
+  document.getElementById('progress').value = data.progress || 0;
+  const consoleEl = document.getElementById('console');
+  const atBottom = consoleEl.scrollTop + consoleEl.clientHeight >= consoleEl.scrollHeight - 20;
+  consoleEl.textContent = data.logs || 'Ready.';
+  if (atBottom) consoleEl.scrollTop = consoleEl.scrollHeight;
+  if (!data.modelInstalled) {{
+    document.getElementById('modelHint').textContent = 'Background-music separation model missing: run python scripts/setup_models.py.';
+  }}
   document.getElementById('videoHint').textContent = data.uploadedVideo || 'No video uploaded yet.';
   document.getElementById('startButton').disabled = data.running;
+
+  const downloads = document.getElementById('downloads');
+  const linksHtml = (data.outputs || []).map(o =>
+    `<strong>${{o.language}}</strong>: ` + o.files.map(f => `<a href="${{f.url}}&download=1">${{f.label}}</a>`).join(' · ')
+  ).join('<br>');
+  if (downloads.innerHTML !== linksHtml) downloads.innerHTML = linksHtml;
 
   const preview = document.getElementById('preview');
   const video = document.getElementById('finalVideo');
@@ -424,18 +450,21 @@ async function uploadVideo() {{
   return data.path;
 }}
 
-async function downloadModel() {{
-  try {{
-    await api('/api/download-model', {{ method: 'POST' }});
-    await refresh();
-  }} catch (error) {{
-    showError(error);
-  }}
+function selectedTargets() {{
+  return Array.from(document.getElementById('target').selectedOptions).map(o => o.value);
 }}
 
-async function setupLatentSync() {{
+async function downloadModel() {{
   try {{
-    await api('/api/setup-latentsync', {{ method: 'POST' }});
+    await api('/api/download-model', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{
+        targets: selectedTargets(),
+        whisper: document.getElementById('whisper').value,
+        lipSync: document.getElementById('lipSync').checked
+      }})
+    }});
     await refresh();
   }} catch (error) {{
     showError(error);
@@ -452,13 +481,19 @@ async function startDubbing() {{
       await uploadVideo();
     }}
 
-    const source = document.getElementById('source').value;
-    const target = document.getElementById('target').value;
-    const lipSync = document.getElementById('lipSync').checked;
+    const targets = selectedTargets();
+    if (!targets.length) throw new Error('Pick at least one target language.');
     await api('/api/run', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ source, target, lipSync }})
+      body: JSON.stringify({{
+        source: document.getElementById('source').value,
+        targets,
+        voice: document.getElementById('voice').value,
+        whisper: document.getElementById('whisper').value,
+        separate: document.getElementById('separate').checked,
+        lipSync: document.getElementById('lipSync').checked
+      }})
     }});
     await refresh();
   }} catch (error) {{
@@ -499,51 +534,60 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif parsed.path == "/media/output-video":
-            self.handle_video()
+        elif parsed.path == "/media/file":
+            query = urllib.parse.parse_qs(parsed.query)
+            self.handle_file(query.get("path", [""])[0], download="download" in query)
         elif parsed.path == "/api/status":
             with state_lock:
                 logs = "".join(state["logs"])
                 status = state["status"]
+                progress = state["progress"]
                 running = state["process"] is not None
                 uploaded_video = state["uploaded_video"]
-                output_video = state["output_video"]
-            output_video_path = Path(output_video) if output_video else None
-            output_video_exists = bool(output_video_path and output_video_path.exists())
-            output_video_url = ""
-            if output_video_exists:
-                output_video_url = f"/media/output-video?v={int(output_video_path.stat().st_mtime)}"
-            voxcpm_ready, _ = model_ready()
+                result = state["result"]
+            outputs, preview_url = [], ""
+            for output in (result or {}).get("outputs", []):
+                files = []
+                for kind, label in FILE_LABELS.items():
+                    path = output["files"].get(kind)
+                    if path and Path(path).exists():
+                        url = f"/media/file?path={urllib.parse.quote(path)}&v={int(Path(path).stat().st_mtime)}"
+                        files.append({"kind": kind, "label": label, "url": url})
+                        if not preview_url and kind in ("video_lipsync", "video"):
+                            preview_url = url
+                outputs.append({"language": output["language"], "files": files})
             json_response(
                 self,
                 {
                     "status": status,
+                    "progress": progress,
                     "running": running,
                     "logs": logs,
                     "uploadedVideo": uploaded_video,
-                    "outputVideo": output_video if output_video_exists else "",
-                    "outputVideoUrl": output_video_url,
+                    "outputs": outputs,
+                    "outputVideoUrl": preview_url,
                     "modelInstalled": MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 0,
-                    "modelSizeMb": round(MODEL_PATH.stat().st_size / (1024 * 1024), 1) if MODEL_PATH.exists() else 0,
-                    "voxcpmModelInstalled": voxcpm_ready,
-                    "latentSyncReady": latentsync_files_ready(),
                 },
             )
         else:
             json_response(self, {"error": "Not found"}, 404)
+
+    def read_json(self):
+        content_length = int(self.headers.get("Content-Length", "0"))
+        return json.loads(self.rfile.read(content_length) or "{}")
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/upload":
             self.handle_upload()
         elif parsed.path == "/api/download-model":
-            ok, message = run_process(
-                [sys.executable, str(BASE_DIR / "scripts" / "setup_models.py")],
-                "Downloading models",
-            )
-            json_response(self, {"ok": ok, "message": message}, 200 if ok else 409)
-        elif parsed.path == "/api/setup-latentsync":
-            ok, message = run_process([sys.executable, str(BASE_DIR / "scripts" / "setup_latentsync.py")], "Setting up LatentSync")
+            payload = self.read_json()
+            command = [sys.executable, str(CLI), "--download-models",
+                       "--whisper-model", payload.get("whisper") or "medium",
+                       "--target", *(payload.get("targets") or ["en"])]
+            if payload.get("lipSync"):
+                command.append("--lip-sync")
+            ok, message = run_process(command, "Downloading models")
             json_response(self, {"ok": ok, "message": message}, 200 if ok else 409)
         elif parsed.path == "/api/run":
             self.handle_run()
@@ -589,26 +633,26 @@ class Handler(BaseHTTPRequestHandler):
         add_log(f"Uploaded video: {output_path}\n")
         json_response(self, {"ok": True, "path": str(output_path)})
 
-    def handle_video(self):
-        with state_lock:
-            output_video = state["output_video"]
-        if not output_video:
-            json_response(self, {"error": "No output video yet"}, 404)
+    def handle_file(self, requested, download=False):
+        if not requested:
+            json_response(self, {"error": "No file requested"}, 404)
             return
 
-        video_path = Path(output_video).resolve()
+        video_path = Path(requested).resolve()
         try:
             video_path.relative_to(OUTPUT_DIR.resolve())
         except ValueError:
-            json_response(self, {"error": "Invalid output video path"}, 403)
+            json_response(self, {"error": "Invalid output path"}, 403)
             return
-        if not video_path.exists():
-            json_response(self, {"error": "Output video not found"}, 404)
+        if not video_path.is_file():
+            json_response(self, {"error": "Output file not found"}, 404)
             return
 
         file_size = video_path.stat().st_size
         range_header = self.headers.get("Range")
-        content_type = mimetypes.guess_type(str(video_path))[0] or "video/mp4"
+        content_type = mimetypes.guess_type(str(video_path))[0] or "application/octet-stream"
+        if video_path.suffix.lower() == ".srt":
+            content_type = "text/plain; charset=utf-8"
 
         start = 0
         end = file_size - 1
@@ -636,6 +680,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(chunk_size))
         if status_code == 206:
             self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+        if download:
+            quoted = urllib.parse.quote(video_path.name)
+            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quoted}")
         self.end_headers()
 
         with video_path.open("rb") as video_file:
@@ -652,46 +699,27 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
     def handle_run(self):
-        content_length = int(self.headers.get("Content-Length", "0"))
-        payload = json.loads(self.rfile.read(content_length) or "{}")
-        source = payload.get("source") or "automatic"
-        target = payload.get("target") or "en"
-        lip_sync = bool(payload.get("lipSync"))
-        source_arg = "auto" if source == "automatic" else source
+        payload = self.read_json()
+        targets = payload.get("targets") or ["en"]
 
         with state_lock:
             uploaded_video = state["uploaded_video"]
         if not uploaded_video:
             json_response(self, {"error": "Upload a video first."}, 400)
             return
-        if not MODEL_PATH.exists():
-            json_response(self, {"error": "Download the required models first."}, 400)
-            return
-        voxcpm_ready, _ = model_ready()
-        if not voxcpm_ready:
-            json_response(self, {"error": "Download the VoxCPM2 model first."}, 400)
-            return
-        if lip_sync and not latentsync_files_ready():
-            json_response(
-                self,
-                {"error": "LatentSync files are missing. Click `Setup / Check LatentSync` first."},
-                400,
-            )
-            return
 
         command = [
-            sys.executable,
-            str(BASE_DIR / "scripts" / "run_pipeline.py"),
-            uploaded_video,
-            "--source-language",
-            source_arg,
-            "--target-language",
-            target,
+            sys.executable, str(CLI), uploaded_video,
+            "--source", payload.get("source") or "auto",
+            "--target", *targets,
+            "--voice", payload.get("voice") or "auto",
+            "--whisper-model", payload.get("whisper") or "medium",
         ]
-        if lip_sync:
+        if payload.get("separate") is False:
+            command.append("--no-separation")
+        if payload.get("lipSync"):
             command.append("--lip-sync")
-        output_path = expected_output_path(uploaded_video, lip_sync=lip_sync)
-        ok, message = run_process(command, "Running", output_path=output_path)
+        ok, message = run_process(command, "Starting", clear_result=True)
         json_response(self, {"ok": ok, "message": message}, 200 if ok else 409)
 
     def log_message(self, format, *args):

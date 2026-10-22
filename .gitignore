@@ -40,3 +40,8 @@ vocal-remover/models/*.pt
 vocal-remover/models/*.ckpt
 vocal-remover/models/*.part
 !vocal-remover/models/.gitkeep
+
+# Downloaded models (dubbing pipeline) and job outputs
+models/
+outputs/
+venv/
