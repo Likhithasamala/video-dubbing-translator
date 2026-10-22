@@ -132,6 +132,7 @@ def page():
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Video Dubbing Translator</title>
+  <link rel="icon" href="/favicon.ico">
   <style>
     :root {{
       --bg: #f4f7fb;
@@ -526,8 +527,21 @@ async function openOutput() {{
     showError(error);
   }}
 }}
-setInterval(refresh, 1000);
-refresh();
+async function safeRefresh() {{
+  try {{
+    await refresh();
+    setStatusNote('');
+  }} catch (error) {{
+    // A transient network blip (e.g. Wi-Fi reconnect) fails one poll; the next retries.
+    setStatusNote('Reconnecting…');
+  }}
+}}
+function setStatusNote(text) {{
+  const el = document.getElementById('status');
+  if (el) el.title = text;
+}}
+setInterval(safeRefresh, 1000);
+safeRefresh();
 </script>
 </body>
 </html>"""
@@ -541,6 +555,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif parsed.path == "/favicon.ico":
+            body = (b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">'
+                    b'<rect width="16" height="16" rx="3" fill="#2563eb"/>'
+                    b'<path d="M5 4.5v7l6-3.5z" fill="#fff"/></svg>')
+            self.send_response(200)
+            self.send_header("Content-Type", "image/svg+xml")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "public, max-age=86400")
             self.end_headers()
             self.wfile.write(body)
         elif parsed.path == "/media/file":
