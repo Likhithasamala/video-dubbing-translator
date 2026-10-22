@@ -114,6 +114,7 @@ def run(
     voice="auto",
     separate=True,
     lip_sync=False,
+    lip_sync_quality="best",
     output_root=OUTPUT_ROOT,
     log=_log,
 ):
@@ -275,7 +276,8 @@ def run(
                 progress(base + span * 0.75, f"Lip syncing {target.name} video")
                 files["video_lipsync"] = out_dir / f"{name}_lipsync.mp4"
                 run_lip_sync(video, files["audio_wav"], files["video_lipsync"], dub_segments,
-                             voice_track, dub.SAMPLE_RATE, work_dir, original_audio=vocals_path, log=log)
+                             voice_track, dub.SAMPLE_RATE, work_dir, original_audio=vocals_path,
+                             enhance=lip_sync_quality, log=log)
         else:
             files.pop("video")
 

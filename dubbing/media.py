@@ -28,23 +28,44 @@ def probe(path):
     if not FFPROBE:
         raise RuntimeError("ffprobe was not found on PATH.")
     result = subprocess.run(
-        [FFPROBE, "-v", "error", "-show_entries", "format=duration:stream=codec_type,r_frame_rate",
+        [FFPROBE, "-v", "error", "-show_entries",
+         "format=duration:stream=codec_type,r_frame_rate,color_space,color_transfer,color_primaries,color_range",
          "-of", "json", str(path)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True,
     )
     data = json.loads(result.stdout)
     streams = data.get("streams", [])
     fps = None
+    color = {}
     for stream in streams:
         if stream.get("codec_type") == "video":
             num, _, den = stream.get("r_frame_rate", "0/1").partition("/")
             fps = float(num) / float(den or 1) if float(den or 1) else None
+            color = {key: stream.get(key) for key in
+                     ("color_space", "color_transfer", "color_primaries", "color_range")}
     return {
         "duration": float(data["format"]["duration"]),
         "has_video": any(s.get("codec_type") == "video" for s in streams),
         "has_audio": any(s.get("codec_type") == "audio" for s in streams),
         "fps": fps,
+        "color": color,
     }
+
+
+def color_args(info):
+    """FFmpeg flags that tag re-encoded video with the source's colour metadata.
+
+    OpenCV hands us raw BGR frames with no colour tags; without these flags some
+    players guess the wrong matrix and the whole clip looks shaded/washed out.
+    """
+    color = info.get("color") or {}
+    flags = []
+    for key, flag in (("color_space", "-colorspace"), ("color_transfer", "-color_trc"),
+                      ("color_primaries", "-color_primaries"), ("color_range", "-color_range")):
+        value = color.get(key)
+        if value and value != "unknown":
+            flags += [flag, {"tv": "mpeg", "pc": "jpeg"}.get(value, value)]
+    return flags
 
 
 def extract_audio(video_path, wav_path, sample_rate=44100, channels=2):

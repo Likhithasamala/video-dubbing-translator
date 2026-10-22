@@ -114,6 +114,11 @@ def mms_model(code):
     )
 
 
+def span_model():
+    """SPAN x4 super-resolution (2 MB): sharpens the Wav2Lip mouth patch in ~0.1 s/frame."""
+    return _file(GFPGAN_REPO, "span_kendata_x4.onnx")
+
+
 def gfpgan_model():
     """GFPGAN v1.4 face restoration (Apache-2.0), ONNX export from the FaceFusion project."""
     return _file(GFPGAN_REPO, "gfpgan_1.4.onnx")

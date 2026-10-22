@@ -336,8 +336,15 @@ def page():
         </label>
         <label class="checkline" for="lipSync" style="margin-top:8px">
           <input id="lipSync" type="checkbox">
-          Lip sync (HD, only while the on-screen person speaks; ~2 s per frame on CPU)
+          Lip sync (only while the on-screen person speaks)
         </label>
+        <div style="margin-top:8px">
+          <label for="lipSyncQuality">Lip sync quality</label>
+          <select id="lipSyncQuality">
+            <option value="best" selected>Best — HD mouth, demo quality (recommended)</option>
+            <option value="fast">Fast — quick draft preview</option>
+          </select>
+        </div>
         <button class="secondary" style="margin-top:10px" onclick="downloadModel()">Download Models for Selected Languages</button>
         <div id="modelHint" class="hint">All models are free and run offline after the first download.</div>
       </div>
@@ -462,7 +469,8 @@ async function downloadModel() {{
       body: JSON.stringify({{
         targets: selectedTargets(),
         whisper: document.getElementById('whisper').value,
-        lipSync: document.getElementById('lipSync').checked
+        lipSync: document.getElementById('lipSync').checked,
+        lipSyncQuality: document.getElementById('lipSyncQuality').value
       }})
     }});
     await refresh();
@@ -492,7 +500,8 @@ async function startDubbing() {{
         voice: document.getElementById('voice').value,
         whisper: document.getElementById('whisper').value,
         separate: document.getElementById('separate').checked,
-        lipSync: document.getElementById('lipSync').checked
+        lipSync: document.getElementById('lipSync').checked,
+        lipSyncQuality: document.getElementById('lipSyncQuality').value
       }})
     }});
     await refresh();
@@ -718,7 +727,7 @@ class Handler(BaseHTTPRequestHandler):
         if payload.get("separate") is False:
             command.append("--no-separation")
         if payload.get("lipSync"):
-            command.append("--lip-sync")
+            command += ["--lip-sync", "--lip-sync-quality", payload.get("lipSyncQuality") or "best"]
         ok, message = run_process(command, "Starting", clear_result=True)
         json_response(self, {"ok": ok, "message": message}, 200 if ok else 409)
 

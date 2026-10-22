@@ -419,6 +419,24 @@ class FaceEnhancer:
         return back, valid
 
 
+class PatchSharpener:
+    """SPAN x4 super-resolution on the 96 px Wav2Lip output: 20x faster than GFPGAN."""
+
+    def __init__(self):
+        import onnxruntime
+
+        options = onnxruntime.SessionOptions()
+        options.intra_op_num_threads = max(1, (os.cpu_count() or 8) // 2)
+        self.session = onnxruntime.InferenceSession(str(models.span_model()), options,
+                                                    providers=["CPUExecutionProvider"])
+        self.input_name = self.session.get_inputs()[0].name
+
+    def __call__(self, patch):
+        blob = (cv2.cvtColor(patch, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
+        out = self.session.run(None, {self.input_name: blob})[0][0].transpose(1, 2, 0)
+        return cv2.cvtColor(np.clip(out * 255.0, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+
+
 def mouth_mask(shape, points):
     """Soft ellipse over the lips and the jaw that moves with them (not the whole lower face)."""
     eyes, mouth = points[:2].mean(axis=0), points[3:5].mean(axis=0)
@@ -451,17 +469,21 @@ def match_color(source, target, mask):
 # --- Main entry point ----------------------------------------------------------------
 
 def lip_sync(video_path, audio_path, out_path, segments, voice_track, voice_rate, work_dir,
-             original_audio=None, enhance=True, log=print):
+             original_audio=None, enhance="best", log=print):
+    # enhance: "best" = GFPGAN (~2 s/frame, demo quality), "fast" = SPAN draft, None = plain.
+    if enhance is True:
+        enhance = "best"
     torch.set_num_threads(max(1, (os.cpu_count() or 8) // 2))
     work_dir = Path(work_dir)
     info = media.probe(video_path)
     fps = min(round(info["fps"] or 25), 30)
+    color = media.color_args(info)
 
     # Constant frame rate source so frame N lines up with audio time N / fps.
     cfr_path = work_dir / "lipsync_cfr.mp4"
     log(f"Preparing {fps} fps video for lip sync...")
     media.ffmpeg("-i", video_path, "-an", "-vf", f"fps={fps}", "-c:v", "libx264", "-preset", "veryfast",
-                 "-crf", "16", "-pix_fmt", "yuv420p", cfr_path)
+                 "-crf", "16", "-pix_fmt", "yuv420p", *color, cfr_path)
 
     capture = cv2.VideoCapture(str(cfr_path))
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -481,19 +503,22 @@ def lip_sync(video_path, audio_path, out_path, segments, voice_track, voice_rate
     tracks = smooth_tracks(raw_tracks, width, height)
     tracks[~active] = np.nan
     log(f"Lip sync will re-render {int((active & ~np.isnan(tracks[:, 0])).sum())} of {frame_count} frames.")
-    enhancer = None
-    if enhance:
-        try:
-            log("Loading GFPGAN face enhancer...")
+    enhancer = sharpener = None
+    try:
+        if enhance == "best":
+            log("Loading GFPGAN face enhancer (slow, ~2 s per frame)...")
             enhancer = FaceEnhancer()
-        except Exception as exc:  # still produce a lip-synced video, just softer
-            log(f"WARNING: face enhancer unavailable ({exc}); continuing without it.")
+        elif enhance:
+            log("Loading SPAN mouth sharpener...")
+            sharpener = PatchSharpener()
+    except Exception as exc:  # still produce a lip-synced video, just softer
+        log(f"WARNING: enhancer unavailable ({exc}); continuing without it.")
 
     encoder = subprocess.Popen(
         [media.FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
          "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
          "-i", str(audio_path), "-map", "0:v:0", "-map", "1:a:0",
-         "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+         "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", *color,
          "-c:a", "aac", "-b:a", "192k", "-shortest", str(out_path)],
         stdin=subprocess.PIPE,
     )
@@ -523,8 +548,10 @@ def lip_sync(video_path, audio_path, out_path, segments, voice_track, voice_rate
                 x1, y1, x2, y2 = track[:4].astype(int)
                 points = track[4:].reshape(5, 2)
                 synthetic = frame.copy()
-                synthetic[y1:y2, x1:x2] = cv2.resize(
-                    np.clip(prediction, 0, 255).astype(np.uint8), (x2 - x1, y2 - y1), interpolation=cv2.INTER_CUBIC)
+                patch = np.clip(prediction, 0, 255).astype(np.uint8)
+                if sharpener is not None:
+                    patch = sharpener(patch)   # 96 px -> 384 px with restored detail
+                synthetic[y1:y2, x1:x2] = cv2.resize(patch, (x2 - x1, y2 - y1), interpolation=cv2.INTER_CUBIC)
                 mask = mouth_mask(frame.shape, points)
                 if enhancer is not None:
                     restored, valid = enhancer(synthetic, points)

@@ -42,6 +42,8 @@ def parse_args():
                         help="Dubbing voice; auto picks from the original speaker's pitch")
     parser.add_argument("--no-separation", action="store_true", help="Skip music/voice separation (faster)")
     parser.add_argument("--lip-sync", action="store_true", help="Also render a Wav2Lip lip-synced video")
+    parser.add_argument("--lip-sync-quality", default="best", choices=["best", "fast"],
+                        help="best: GFPGAN HD mouth (demo quality, ~2 s/frame on CPU). fast: quick draft preview")
     parser.add_argument("--download-models", action="store_true", help="Download the models and exit")
     parser.add_argument("--list-languages", action="store_true", help="Print supported languages and exit")
     return parser.parse_args()
@@ -75,6 +77,7 @@ def main():
         voice=args.voice,
         separate=not args.no_separation,
         lip_sync=args.lip_sync,
+        lip_sync_quality=args.lip_sync_quality,
     )
 
 
