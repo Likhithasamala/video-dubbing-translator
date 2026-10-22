@@ -7,6 +7,8 @@ speaking (originally or in the dub) are re-rendered; everything else is copied.
 
 import os
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -393,24 +395,46 @@ FFHQ_512 = np.array([[0.37691676, 0.46864664], [0.62285697, 0.46912813], [0.5012
                      [0.39308822, 0.72541100], [0.61150205, 0.72490465]], dtype=np.float32) * 512
 
 
+def _onnx_session(model_path):
+    """Open an ONNX session on the GPU (DirectML) when available, else multi-threaded CPU.
+
+    Returns (session, on_gpu). GFPGAN drops from ~2 s to ~0.5 s per frame on an
+    integrated Radeon GPU via DirectML (install `onnxruntime-directml` on Windows).
+    """
+    import onnxruntime
+
+    options = onnxruntime.SessionOptions()
+    if "DmlExecutionProvider" in onnxruntime.get_available_providers():
+        options.enable_mem_pattern = False  # the DirectML provider requires this off
+        wanted = ["DmlExecutionProvider", "CPUExecutionProvider"]
+    else:
+        options.intra_op_num_threads = max(1, (os.cpu_count() or 8) // 2)
+        wanted = ["CPUExecutionProvider"]
+    session = onnxruntime.InferenceSession(str(model_path), options, providers=wanted)
+    return session, "DmlExecutionProvider" in session.get_providers()
+
+
 class FaceEnhancer:
     """GFPGAN v1.4 (Apache-2.0) via ONNX Runtime: restores detail lost by Wav2Lip's 96 px output."""
 
     def __init__(self):
-        import onnxruntime
-
-        options = onnxruntime.SessionOptions()
-        options.intra_op_num_threads = max(1, (os.cpu_count() or 8) // 2)
-        self.session = onnxruntime.InferenceSession(str(models.gfpgan_model()), options,
-                                                    providers=["CPUExecutionProvider"])
+        self.session, self.gpu = _onnx_session(models.gfpgan_model())
         self.input_name = self.session.get_inputs()[0].name
+        # DirectML does not support concurrent Run calls on one session; CPU sessions do.
+        self._run_lock = threading.Lock() if self.gpu else None
+
+    def _run(self, blob):
+        if self._run_lock is not None:
+            with self._run_lock:
+                return self.session.run(None, {self.input_name: blob})
+        return self.session.run(None, {self.input_name: blob})
 
     def __call__(self, frame, points):
         """Return (restored frame-sized image, validity mask) for the face at `points`."""
         matrix = cv2.estimateAffinePartial2D(points, FFHQ_512, method=cv2.LMEDS)[0]
         aligned = cv2.warpAffine(frame, matrix, (512, 512), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
         blob = (cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB).astype(np.float32) / 127.5 - 1.0).transpose(2, 0, 1)[None]
-        restored = self.session.run(None, {self.input_name: blob})[0][0].transpose(1, 2, 0)
+        restored = self._run(blob)[0][0].transpose(1, 2, 0)
         restored = cv2.cvtColor(np.clip((restored + 1.0) * 127.5, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
         inverse = cv2.invertAffineTransform(matrix)
         size = (frame.shape[1], frame.shape[0])
@@ -423,17 +447,17 @@ class PatchSharpener:
     """SPAN x4 super-resolution on the 96 px Wav2Lip output: 20x faster than GFPGAN."""
 
     def __init__(self):
-        import onnxruntime
-
-        options = onnxruntime.SessionOptions()
-        options.intra_op_num_threads = max(1, (os.cpu_count() or 8) // 2)
-        self.session = onnxruntime.InferenceSession(str(models.span_model()), options,
-                                                    providers=["CPUExecutionProvider"])
+        self.session, self.gpu = _onnx_session(models.span_model())
         self.input_name = self.session.get_inputs()[0].name
+        self._run_lock = threading.Lock() if self.gpu else None
 
     def __call__(self, patch):
         blob = (cv2.cvtColor(patch, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
-        out = self.session.run(None, {self.input_name: blob})[0][0].transpose(1, 2, 0)
+        if self._run_lock is not None:
+            with self._run_lock:
+                out = self.session.run(None, {self.input_name: blob})[0][0].transpose(1, 2, 0)
+        else:
+            out = self.session.run(None, {self.input_name: blob})[0][0].transpose(1, 2, 0)
         return cv2.cvtColor(np.clip(out * 255.0, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
 
 
@@ -470,7 +494,8 @@ def match_color(source, target, mask):
 
 def lip_sync(video_path, audio_path, out_path, segments, voice_track, voice_rate, work_dir,
              original_audio=None, enhance="best", log=print):
-    # enhance: "best" = GFPGAN (~2 s/frame, demo quality), "fast" = SPAN draft, None = plain.
+    # enhance: "best" = GFPGAN (demo quality; ~0.5 s/frame on GPU, ~2 s on CPU),
+    # "fast" = SPAN draft, None = plain.
     if enhance is True:
         enhance = "best"
     torch.set_num_threads(max(1, (os.cpu_count() or 8) // 2))
@@ -506,8 +531,10 @@ def lip_sync(video_path, audio_path, out_path, segments, voice_track, voice_rate
     enhancer = sharpener = None
     try:
         if enhance == "best":
-            log("Loading GFPGAN face enhancer (slow, ~2 s per frame)...")
+            log("Loading GFPGAN face enhancer...")
             enhancer = FaceEnhancer()
+            log("  GFPGAN on GPU via DirectML (~0.5 s per frame)" if enhancer.gpu
+                else "  GFPGAN on CPU (~2 s per frame; install onnxruntime-directml for GPU)")
         elif enhance:
             log("Loading SPAN mouth sharpener...")
             sharpener = PatchSharpener()
@@ -525,6 +552,30 @@ def lip_sync(video_path, audio_path, out_path, segments, voice_track, voice_rate
 
     pending = []  # (frame, track row or None, frame_index)
     synced = 0
+    # Enhancement is per-frame and independent: overlap two frames to hide CPU/GPU idle time.
+    pool = ThreadPoolExecutor(max_workers=2) if (enhancer or sharpener) else None
+
+    def render(i, track, prediction):
+        frame = pending[i][0]
+        x1, y1, x2, y2 = track[:4].astype(int)
+        points = track[4:].reshape(5, 2)
+        synthetic = frame.copy()
+        patch = np.clip(prediction, 0, 255).astype(np.uint8)
+        if sharpener is not None:
+            patch = sharpener(patch)   # 96 px -> 384 px with restored detail
+        synthetic[y1:y2, x1:x2] = cv2.resize(patch, (x2 - x1, y2 - y1), interpolation=cv2.INTER_CUBIC)
+        mask = mouth_mask(frame.shape, points)
+        if enhancer is not None:
+            restored, valid = enhancer(synthetic, points)
+            mask = mask * valid[..., None]
+            synthetic = restored
+        synthetic = match_color(synthetic, frame, mask)
+        # Only the lips and moving jaw are replaced; beard, cheeks and skin stay original.
+        ys, xs = np.nonzero(mask[..., 0] > 0.003)
+        if ys.size:
+            t, b, l, r = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+            m = mask[t:b, l:r]
+            frame[t:b, l:r] = np.clip(m * synthetic[t:b, l:r] + (1 - m) * frame[t:b, l:r], 0, 255).astype(np.uint8)
 
     def flush():
         nonlocal synced
@@ -543,27 +594,11 @@ def lip_sync(video_path, audio_path, out_path, segments, voice_track, voice_rate
             mel_batch = torch.from_numpy(np.asarray(mels)[:, None])
             with torch.inference_mode():
                 predictions = model(mel_batch, face_batch).permute(0, 2, 3, 1).numpy() * 255.0
-            for (i, track), prediction in zip(jobs, predictions):
-                frame = pending[i][0]
-                x1, y1, x2, y2 = track[:4].astype(int)
-                points = track[4:].reshape(5, 2)
-                synthetic = frame.copy()
-                patch = np.clip(prediction, 0, 255).astype(np.uint8)
-                if sharpener is not None:
-                    patch = sharpener(patch)   # 96 px -> 384 px with restored detail
-                synthetic[y1:y2, x1:x2] = cv2.resize(patch, (x2 - x1, y2 - y1), interpolation=cv2.INTER_CUBIC)
-                mask = mouth_mask(frame.shape, points)
-                if enhancer is not None:
-                    restored, valid = enhancer(synthetic, points)
-                    mask = mask * valid[..., None]
-                    synthetic = restored
-                synthetic = match_color(synthetic, frame, mask)
-                # Only the lips and moving jaw are replaced; beard, cheeks and skin stay original.
-                ys, xs = np.nonzero(mask[..., 0] > 0.003)
-                if ys.size:
-                    t, b, l, r = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
-                    m = mask[t:b, l:r]
-                    frame[t:b, l:r] = np.clip(m * synthetic[t:b, l:r] + (1 - m) * frame[t:b, l:r], 0, 255).astype(np.uint8)
+            if pool is not None:
+                list(pool.map(lambda job: render(job[0][0], job[0][1], job[1]), zip(jobs, predictions)))
+            else:
+                for (i, track), prediction in zip(jobs, predictions):
+                    render(i, track, prediction)
             synced += len(jobs)
         for frame, _, _ in pending:
             encoder.stdin.write(frame.tobytes())
@@ -586,6 +621,8 @@ def lip_sync(video_path, audio_path, out_path, segments, voice_track, voice_rate
                 log(f"  lip sync: {index}/{frame_count} frames ({100 * index // max(frame_count, 1)}%)")
         flush()
     finally:
+        if pool is not None:
+            pool.shutdown(wait=True)
         capture.release()
         encoder.stdin.close()
         encoder.wait()

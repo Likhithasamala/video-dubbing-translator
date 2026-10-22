@@ -43,7 +43,8 @@ def parse_args():
     parser.add_argument("--no-separation", action="store_true", help="Skip music/voice separation (faster)")
     parser.add_argument("--lip-sync", action="store_true", help="Also render a Wav2Lip lip-synced video")
     parser.add_argument("--lip-sync-quality", default="best", choices=["best", "fast"],
-                        help="best: GFPGAN HD mouth (demo quality, ~2 s/frame on CPU). fast: quick draft preview")
+                        help="best: GFPGAN HD mouth (demo quality, ~0.5 s/frame on GPU via DirectML, "
+                             "~2 s/frame on CPU). fast: quick draft preview")
     parser.add_argument("--download-models", action="store_true", help="Download the models and exit")
     parser.add_argument("--list-languages", action="store_true", help="Print supported languages and exit")
     return parser.parse_args()
